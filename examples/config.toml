@@ -1,0 +1,35 @@
+# yahoo-mail-mcp configuration
+#
+# Default location: ~/.config/yahoo-mail-mcp/config.toml
+# Override with the YAHOO_MAIL_MCP_CONFIG env var (absolute path).
+#
+# Every account you want to triage gets an [accounts.<name>] table. The <name>
+# is what you pass as `host` to MCP tool calls — it can be the email handle,
+# a role nickname ("primary"/"work"), or any string. It just has to match
+# consistently between config and tool calls.
+#
+# Credentials can also be supplied via environment variables. Precedence:
+#   1. Per-tool-call params (not currently exposed; future)
+#   2. Env vars (YAHOO_MAIL_MCP_<ACCOUNT>_PASSWORD, uppercased account name)
+#   3. Config file `password` field (NOT recommended for real use)
+#
+# Never commit a real config file with credentials. Use `config.local.toml`
+# (gitignored) or env vars in production.
+
+[defaults]
+host = "imap.mail.yahoo.com"   # Yahoo Mail IMAP server
+port = 993                      # IMAP-over-TLS (implicit TLS)
+use_tls = true
+connect_timeout = 10
+read_timeout = 30
+
+[accounts.primary]
+address = "you@yahoo.com"
+# password = "..."  # only for testing; prefer YAHOO_MAIL_MCP_PRIMARY_PASSWORD env var
+
+# [accounts.work]
+# address = "you@yahoo-inc.example"
+# # password sourced from YAHOO_MAIL_MCP_WORK_PASSWORD env var
+
+# [accounts.legacy]
+# address = "you@ymail.com"   # legacy Yahoo domains also work
