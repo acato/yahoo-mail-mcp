@@ -9,13 +9,21 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+from datetime import date as date_cls
+from typing import Any
 
+from imap_tools import AND
 from mcp.server.fastmcp import FastMCP
 
 from yahoo_mail_mcp import __version__
 from yahoo_mail_mcp.config import Config, config_path, load_config
 from yahoo_mail_mcp.folders import canonical_name
 from yahoo_mail_mcp.imap_client import ConnectionPool
+
+# Hard caps that keep individual tool responses tractable for the LLM. If the
+# user wants more, they paginate via `offset`.
+SEARCH_LIMIT_MAX = 500
+BULK_FETCH_LIMIT_MAX = 100
 
 mcp = FastMCP("yahoo-mail-mcp")
 
@@ -103,6 +111,279 @@ def list_folders(host: str) -> list[dict[str, int | str | None]]:
             }
         )
     return out
+
+
+def _build_search_criteria(
+    *,
+    from_addr: str | None,
+    to_addr: str | None,
+    subject: str | None,
+    body_text: str | None,
+    since: str | None,
+    before: str | None,
+    seen: bool | None,
+    larger_bytes: int | None,
+    smaller_bytes: int | None,
+) -> Any:
+    """Translate user-friendly args into an imap_tools.AND criteria object.
+
+    Date strings are ISO format (YYYY-MM-DD). Yahoo IMAP only supports day-
+    level granularity for SINCE/BEFORE.
+
+    Returns AND("ALL") when no criteria are supplied so the caller still gets
+    a well-formed search query.
+    """
+    kwargs: dict[str, Any] = {}
+    if from_addr is not None:
+        kwargs["from_"] = from_addr
+    if to_addr is not None:
+        kwargs["to"] = to_addr
+    if subject is not None:
+        kwargs["subject"] = subject
+    if body_text is not None:
+        kwargs["body"] = body_text
+    if since is not None:
+        kwargs["date_gte"] = date_cls.fromisoformat(since)
+    if before is not None:
+        kwargs["date_lt"] = date_cls.fromisoformat(before)
+    if seen is not None:
+        kwargs["seen"] = seen
+    if larger_bytes is not None:
+        kwargs["size_gt"] = larger_bytes
+    if smaller_bytes is not None:
+        kwargs["size_lt"] = smaller_bytes
+    if not kwargs:
+        return "ALL"
+    return AND(**kwargs)
+
+
+def _envelope_dict(msg: Any) -> dict[str, Any]:
+    """Format an imap_tools.MailMessage as the envelope-style dict the LLM gets.
+
+    Note: imap_tools exposes `from_values` as a single EmailAddress (the From
+    header is one sender), while `to_values` and `cc_values` are iterables.
+    """
+    from_value = msg.from_values  # single EmailAddress or None
+    to_values = list(msg.to_values) if msg.to_values else []
+    cc_values = list(msg.cc_values) if msg.cc_values else []
+    return {
+        "uid": msg.uid,
+        "from": from_value.email if from_value else "",
+        "from_display": msg.from_ or "",
+        "to": [a.email for a in to_values],
+        "cc": [a.email for a in cc_values],
+        "subject": msg.subject or "",
+        "date": msg.date.isoformat() if msg.date else None,
+        "size": msg.size_rfc822 or 0,
+        "flags": list(msg.flags),
+    }
+
+
+@mcp.tool()
+def search(
+    host: str,
+    folder: str,
+    from_addr: str | None = None,
+    to_addr: str | None = None,
+    subject: str | None = None,
+    body_text: str | None = None,
+    since: str | None = None,
+    before: str | None = None,
+    seen: bool | None = None,
+    larger_bytes: int | None = None,
+    smaller_bytes: int | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Search a folder and return matching message envelopes, newest first.
+
+    All criteria are AND-combined. None values are ignored. At least one
+    criterion is recommended; omitting all returns the full folder.
+
+    Args:
+        host: account nickname from config.
+        folder: IMAP folder name (e.g., "Inbox", "Bulk Mail"). Get the exact
+            name from list_folders().
+        from_addr: substring or address match against the From header.
+        to_addr: substring or address match against the To header.
+        subject: substring match in Subject.
+        body_text: substring match in the message body.
+        since: ISO date "YYYY-MM-DD"; matches messages dated on or after.
+        before: ISO date "YYYY-MM-DD"; matches messages strictly before.
+        seen: true = only read messages; false = only unread; null = both.
+        larger_bytes: minimum message size in bytes.
+        smaller_bytes: maximum message size in bytes.
+        limit: max hits to return (capped at 500). Defaults to 100.
+        offset: pagination offset into the matched UIDs (newest-first order).
+
+    Returns:
+        dict with:
+          - total: total number of matching UIDs in the folder
+          - limit, offset: echoed back so the LLM can paginate
+          - hits: list of envelope dicts (uid, from, from_display, to, cc,
+            subject, date, size, flags). Empty if total == 0 or offset > total.
+    """
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    if limit > SEARCH_LIMIT_MAX:
+        raise ValueError(f"limit must be <= {SEARCH_LIMIT_MAX}")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+
+    pool = _get_pool()
+    mb = pool.get(host)
+    mb.folder.set(folder)
+
+    criteria = _build_search_criteria(
+        from_addr=from_addr,
+        to_addr=to_addr,
+        subject=subject,
+        body_text=body_text,
+        since=since,
+        before=before,
+        seen=seen,
+        larger_bytes=larger_bytes,
+        smaller_bytes=smaller_bytes,
+    )
+
+    uids = list(mb.uids(criteria))
+    # Newest-first by numeric UID. IMAP UIDs are monotonically assigned, so
+    # higher = more recent within a folder (modulo UIDVALIDITY changes).
+    uids.sort(key=int, reverse=True)
+    total = len(uids)
+    page = uids[offset : offset + limit]
+
+    if not page:
+        return {"total": total, "limit": limit, "offset": offset, "hits": []}
+
+    fetched = list(
+        mb.fetch(
+            AND(uid=",".join(page)),
+            headers_only=True,
+            mark_seen=False,
+            bulk=True,
+        )
+    )
+    # Preserve the requested newest-first ordering even if the server returned
+    # the hits in a different order.
+    by_uid = {m.uid: m for m in fetched}
+    hits = [_envelope_dict(by_uid[u]) for u in page if u in by_uid]
+
+    return {"total": total, "limit": limit, "offset": offset, "hits": hits}
+
+
+def _format_message(msg: Any, fields: str) -> dict[str, Any]:
+    """Format a fetched message at the requested verbosity."""
+    out = _envelope_dict(msg)
+    if fields == "headers":
+        return out
+    # body + full
+    out["body_text"] = msg.text or ""
+    out["body_html"] = msg.html or ""
+    if fields == "body":
+        return out
+    # full: include attachment metadata but never the payload
+    out["attachments"] = [
+        {
+            "filename": att.filename,
+            "content_type": att.content_type,
+            "size": att.size,
+        }
+        for att in (msg.attachments or [])
+    ]
+    return out
+
+
+@mcp.tool()
+def fetch_message(
+    host: str,
+    folder: str,
+    uid: str,
+    fields: str = "headers",
+) -> dict[str, Any]:
+    """Fetch a single message by UID.
+
+    Args:
+        host: account nickname from config.
+        folder: IMAP folder name.
+        uid: the UID returned by search().
+        fields: one of "headers" (envelope only — fastest), "body" (envelope
+            + plain text + HTML body), or "full" (everything plus attachment
+            filenames/types/sizes; attachment content is NOT included here).
+
+    Returns:
+        Message dict. Raises ValueError if `fields` is not one of the three
+        allowed values. Returns {"uid": uid, "missing": true} if the UID is
+        not present in the folder (e.g., already deleted).
+    """
+    if fields not in ("headers", "body", "full"):
+        raise ValueError(f"fields must be 'headers', 'body', or 'full'; got {fields!r}")
+
+    pool = _get_pool()
+    mb = pool.get(host)
+    mb.folder.set(folder)
+
+    messages = list(
+        mb.fetch(
+            AND(uid=uid),
+            headers_only=(fields == "headers"),
+            mark_seen=False,
+        )
+    )
+    if not messages:
+        return {"uid": uid, "missing": True}
+    return _format_message(messages[0], fields)
+
+
+@mcp.tool()
+def fetch_messages_bulk(
+    host: str,
+    folder: str,
+    uids: list[str],
+    fields: str = "headers",
+) -> list[dict[str, Any]]:
+    """Fetch many messages at once by UID. Capped at 100 per call.
+
+    Useful after `search()` returns a list of UIDs and you want envelopes
+    or bodies for all of them in one round-trip.
+
+    Args:
+        host: account nickname from config.
+        folder: IMAP folder name.
+        uids: list of UID strings (max 100). Order is preserved in the response.
+        fields: same semantics as fetch_message ("headers" | "body" | "full").
+
+    Returns:
+        List of message dicts in the same order as the requested UIDs. UIDs
+        that aren't present in the folder produce a {"uid": uid, "missing": true}
+        entry rather than being silently dropped.
+    """
+    if not uids:
+        return []
+    if len(uids) > BULK_FETCH_LIMIT_MAX:
+        raise ValueError(
+            f"uids must contain at most {BULK_FETCH_LIMIT_MAX} entries; got {len(uids)}"
+        )
+    if fields not in ("headers", "body", "full"):
+        raise ValueError(f"fields must be 'headers', 'body', or 'full'; got {fields!r}")
+
+    pool = _get_pool()
+    mb = pool.get(host)
+    mb.folder.set(folder)
+
+    fetched = list(
+        mb.fetch(
+            AND(uid=",".join(uids)),
+            headers_only=(fields == "headers"),
+            mark_seen=False,
+            bulk=True,
+        )
+    )
+    by_uid = {m.uid: m for m in fetched}
+    return [
+        _format_message(by_uid[u], fields) if u in by_uid else {"uid": u, "missing": True}
+        for u in uids
+    ]
 
 
 @mcp.tool()
