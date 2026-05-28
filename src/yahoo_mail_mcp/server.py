@@ -12,7 +12,7 @@ import contextlib
 from datetime import date as date_cls
 from typing import Any
 
-from imap_tools import AND
+from imap_tools import AND, MailMessageFlags
 from mcp.server.fastmcp import FastMCP
 
 from yahoo_mail_mcp import __version__
@@ -384,6 +384,115 @@ def fetch_messages_bulk(
         _format_message(by_uid[u], fields) if u in by_uid else {"uid": u, "missing": True}
         for u in uids
     ]
+
+
+def _current_flags(mb: Any, uid: str) -> list[str]:
+    """Return the current flag list for one UID after a STORE operation.
+
+    Falls back to an empty list if the UID can't be re-fetched (e.g., the
+    operation triggered an expunge in the same call).
+    """
+    refetched = list(mb.fetch(AND(uid=uid), headers_only=True, mark_seen=False))
+    return list(refetched[0].flags) if refetched else []
+
+
+@mcp.tool()
+def mark_read(host: str, folder: str, uid: str, read: bool = True) -> dict[str, Any]:
+    """Add or remove the \\Seen flag on a single message.
+
+    Args:
+        host: account nickname from config.
+        folder: IMAP folder name containing the message.
+        uid: the UID of the message.
+        read: true (default) sets \\Seen; false clears it.
+
+    Returns:
+        dict with `uid` and `flags` (the message's flag list after the
+        operation). If the UID is not in the folder, returns
+        {"uid": uid, "missing": true}.
+    """
+    pool = _get_pool()
+    mb = pool.get(host)
+    mb.folder.set(folder)
+
+    existing = list(mb.fetch(AND(uid=uid), headers_only=True, mark_seen=False))
+    if not existing:
+        return {"uid": uid, "missing": True}
+
+    mb.flag([uid], [MailMessageFlags.SEEN], read)
+    return {"uid": uid, "flags": _current_flags(mb, uid)}
+
+
+@mcp.tool()
+def move_message(host: str, folder: str, uid: str, target_folder: str) -> dict[str, Any]:
+    """Move a single message from `folder` to `target_folder`.
+
+    Uses the IMAP MOVE extension when the server supports it (Yahoo does),
+    falling back to COPY + STORE \\Deleted + EXPUNGE otherwise. The
+    underlying `imap_tools.MailBox.move` handles both paths.
+
+    Args:
+        host: account nickname from config.
+        folder: current IMAP folder of the message.
+        uid: source UID.
+        target_folder: destination IMAP folder. Must already exist.
+
+    Returns:
+        dict with `uid` (source), `target_folder`, and `moved: true`. The
+        new UID at the destination is not always knowable from the server's
+        response — callers that need it should `search` the target folder.
+        If the UID is not in `folder`, returns {"uid": uid, "missing": true}.
+    """
+    pool = _get_pool()
+    mb = pool.get(host)
+    mb.folder.set(folder)
+
+    existing = list(mb.fetch(AND(uid=uid), headers_only=True, mark_seen=False))
+    if not existing:
+        return {"uid": uid, "missing": True}
+
+    mb.move([uid], target_folder)
+    return {"uid": uid, "target_folder": target_folder, "moved": True}
+
+
+@mcp.tool()
+def delete_message(host: str, folder: str, uid: str, expunge: bool = True) -> dict[str, Any]:
+    """Delete a single message.
+
+    With `expunge=true` (default): flags \\Deleted and immediately expunges,
+    so the message is gone from the folder. With `expunge=false`: only sets
+    the \\Deleted flag; on most IMAP servers the message stays visible
+    (struck-through in clients) until something else expunges.
+
+    **Yahoo quirk:** Yahoo's IMAP auto-expunges on every `STORE \\Deleted`,
+    so `expunge=false` is effectively a no-op against Yahoo — the message
+    disappears either way. The returned `expunged` field reflects what *you*
+    asked for, not what Yahoo actually did under the hood.
+
+    Args:
+        host: account nickname from config.
+        folder: IMAP folder containing the message.
+        uid: UID to delete.
+        expunge: whether to expunge immediately. Defaults to true.
+
+    Returns:
+        dict with `uid`, `deleted: true`, and `expunged: bool`. If the UID
+        is not in the folder, returns {"uid": uid, "missing": true}.
+    """
+    pool = _get_pool()
+    mb = pool.get(host)
+    mb.folder.set(folder)
+
+    existing = list(mb.fetch(AND(uid=uid), headers_only=True, mark_seen=False))
+    if not existing:
+        return {"uid": uid, "missing": True}
+
+    if expunge:
+        mb.delete([uid])
+    else:
+        mb.flag([uid], [MailMessageFlags.DELETED], True)
+
+    return {"uid": uid, "deleted": True, "expunged": bool(expunge)}
 
 
 @mcp.tool()

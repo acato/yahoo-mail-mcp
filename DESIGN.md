@@ -58,6 +58,7 @@ All tools take a `host` parameter (the account nickname from config). No default
 | Some legacy messages have malformed quoted-printable encoding | `imap_tools` handles most; fall back to raw bytes + manual decode with `errors="replace"` |
 | Attachment content-type sometimes mislabeled | Trust `Content-Disposition: attachment` over `Content-Type` for is-attachment determination |
 | Spam folder UIDs may renumber after Yahoo's automatic purge | UIDVALIDITY check on every connect; invalidate cached UIDs if changed |
+| Yahoo auto-expunges on `STORE \\Deleted` (no explicit EXPUNGE needed) | `delete_message(expunge=False)` is silently a no-op on Yahoo; documented in the tool docstring. The returned `expunged` field reflects the caller's intent, not Yahoo's actual behavior |
 
 ## 6. Configuration
 

@@ -1,6 +1,6 @@
 [project]
 name = "yahoo-mail-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for triaging a Yahoo Mail mailbox over IMAP (read, search, move, delete, mark-read, bulk-purge-from-sender)"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -10,7 +10,7 @@ authors = [
 ]
 keywords = ["mcp", "yahoo", "yahoo-mail", "imap", "email", "model-context-protocol"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
