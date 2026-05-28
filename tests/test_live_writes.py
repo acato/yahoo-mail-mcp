@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import uuid
+from datetime import UTC, datetime
 
 import pytest
 from imap_tools import AND, H, MailMessageFlags
@@ -253,3 +255,102 @@ def test_live_delete_message_missing_uid(pool, account_name, test_folder):
 
     result = delete_message(account_name, test_folder, "999999999")
     assert result == {"uid": "999999999", "missing": True}
+
+
+# --------------------- bulk_purge_from ---------------------------------------
+
+
+def _append_test_message(mb, folder: str, from_address: str) -> str:
+    """APPEND a fabricated message from `from_address`. Returns the marker."""
+    marker = uuid.uuid4().hex
+    rfc822 = (
+        f"From: {from_address}\r\n"
+        f"To: yahoo-mail-mcp-test\r\n"
+        f"Subject: bulk-purge test [{marker}]\r\n"
+        f"Message-ID: <{marker}@yahoo-mail-mcp.test>\r\n"
+        f"Date: {datetime.now(UTC).strftime('%a, %d %b %Y %H:%M:%S +0000')}\r\n"
+        f"Content-Type: text/plain; charset=utf-8\r\n"
+        f"\r\n"
+        f"Test {marker}. Safe to delete.\r\n"
+    ).encode()
+    mb.append(rfc822, folder)
+    return marker
+
+
+def test_live_bulk_purge_refuses_then_purges(pool, account_name, test_folder):
+    """Full refusal-then-success workflow for the bulk-purge tool."""
+    from yahoo_mail_mcp.server import bulk_purge_from
+
+    mb = pool.get(account_name)
+    # Unique fake sender so we don't collide with anything else in _mcp-test.
+    fake_sender = f"test-spammer-{uuid.uuid4().hex[:8]}@yahoo-mail-mcp.test"
+
+    # Seed 3 messages from the fake sender.
+    for _ in range(3):
+        _append_test_message(mb, test_folder, fake_sender)
+
+    # Sanity: search sees all 3.
+    mb.folder.set(test_folder)
+    matched = list(mb.uids(AND(from_=fake_sender)))
+    assert len(matched) == 3, f"expected 3 seeded messages, found {len(matched)}"
+
+    try:
+        # Refusal: wrong count.
+        refused = bulk_purge_from(account_name, test_folder, fake_sender, confirm_count=2)
+        assert refused["refused"] is True
+        assert refused["reason"] == "count_mismatch"
+        assert refused["expected_count"] == 2
+        assert refused["actual_count"] == 3
+        assert "confirm_count=3" in refused["message"]
+
+        # Verify nothing was deleted on refusal.
+        mb.folder.set(test_folder)
+        still_there = list(mb.uids(AND(from_=fake_sender)))
+        assert len(still_there) == 3
+
+        # Success: correct count.
+        purged = bulk_purge_from(account_name, test_folder, fake_sender, confirm_count=3)
+        assert purged == {
+            "purged_count": 3,
+            "confirmed_count": 3,
+            "from_address": fake_sender,
+            "folder": test_folder,
+        }
+
+        # Verify all gone.
+        mb.folder.set(test_folder)
+        gone = list(mb.uids(AND(from_=fake_sender)))
+        assert gone == []
+    finally:
+        # Defensive cleanup if anything is left behind.
+        with contextlib.suppress(Exception):
+            mb.folder.set(test_folder)
+            leftover = list(mb.uids(AND(from_=fake_sender)))
+            if leftover:
+                mb.delete(leftover)
+
+
+def test_live_bulk_purge_zero_match_zero_confirm(pool, account_name, test_folder):
+    """confirm_count=0 against a non-existent sender — no-op success."""
+    from yahoo_mail_mcp.server import bulk_purge_from
+
+    fake_sender = f"never-existed-{uuid.uuid4().hex[:8]}@yahoo-mail-mcp.test"
+    result = bulk_purge_from(account_name, test_folder, fake_sender, confirm_count=0)
+    assert result == {
+        "purged_count": 0,
+        "confirmed_count": 0,
+        "from_address": fake_sender,
+        "folder": test_folder,
+    }
+
+
+def test_live_bulk_purge_zero_match_nonzero_confirm_refuses(pool, account_name, test_folder):
+    """confirm_count>0 against a non-existent sender — refused, no delete."""
+    from yahoo_mail_mcp.server import bulk_purge_from
+
+    fake_sender = f"never-existed-{uuid.uuid4().hex[:8]}@yahoo-mail-mcp.test"
+    result = bulk_purge_from(account_name, test_folder, fake_sender, confirm_count=5)
+
+    assert result["refused"] is True
+    assert result["actual_count"] == 0
+    assert result["expected_count"] == 5

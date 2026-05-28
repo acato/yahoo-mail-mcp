@@ -112,9 +112,13 @@ Error codes: `auth_failed`, `connection_failed`, `folder_not_found`, `message_no
 
 ## 10. Open questions
 
-- **Bulk delete confirmation UX.** `bulk_purge_from` requires `confirm_count` to match a prior SEARCH exactly. Should we also support a dry-run mode that returns the UIDs without deleting? Probably yes; deferred to Phase 2.
+- **Bulk delete confirmation UX.** `bulk_purge_from` requires `confirm_count` to match a prior SEARCH exactly. A dry-run mode was considered but rejected — the existing `search(from_addr=...)` workflow already gives the same information without a tool-surface bulge. Re-evaluate if usage shows the round-trip is annoying.
 - **Trash vs delete.** Some accounts have a `\Trash` folder that's the standard target for delete; others have `Deleted Items` or nothing. `delete_message` defaults to flag+expunge (gone, no trash). Should there be a `to_trash=true` option that moves instead? Probably yes; deferred.
 - **Multi-account parallelism.** v0 serializes per-account. If user wants to run the same triage across all accounts at once, do we parallelize internally or require the LLM to fan out? Punt to Phase 2.
+- **UIDVALIDITY tracking** (deferred 2026-05-28). Real risk at scale: if a folder's UIDVALIDITY changes between an LLM's `search` and a follow-up `fetch`/`move`/`delete`, the UIDs are stale and may target the wrong messages. Doesn't bite at the current 12.5k-mailbox scale during an interactive session. Will bake in when (a) Yahoo demonstrates UIDVALIDITY churn against this account, or (b) the MCP is used by a longer-running automated workflow.
+- **SEARCH ALL pagination** (deferred 2026-05-28). The originally-scoped 100k+ mailbox turned out to be 10k Inbox at most, so the 1k-UID chunking guard isn't needed in practice. Will add if a future account hits the cap.
+- **LIST timeout retries with exponential backoff** (deferred 2026-05-28). 12 folders on the test account; LIST is fast. Will add if a future account has a folder explosion.
+- **Attachment encoding fallback** (deferred 2026-05-28). Live tests against today's mail haven't surfaced any malformed quoted-printable bodies yet. Will add when one bites.
 
 ## 11. Release plan
 

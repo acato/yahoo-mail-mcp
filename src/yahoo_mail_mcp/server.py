@@ -496,6 +496,90 @@ def delete_message(host: str, folder: str, uid: str, expunge: bool = True) -> di
 
 
 @mcp.tool()
+def bulk_purge_from(
+    host: str,
+    folder: str,
+    from_address: str,
+    confirm_count: int,
+) -> dict[str, Any]:
+    """Delete every message from `from_address` in `folder`. Safety-gated.
+
+    Required workflow:
+      1. Use `search(host, folder, from_addr=from_address)` to see how many
+         messages match and what they are.
+      2. Call this tool with `confirm_count` equal to the `total` returned
+         by that search.
+
+    If the live SEARCH count doesn't equal `confirm_count` (e.g., a new
+    message from the same sender arrived between the search and the purge,
+    or you miscounted), the tool **refuses** and returns a structured
+    refusal payload. Re-run the search and try again with the corrected
+    count.
+
+    Args:
+        host: account nickname from config.
+        folder: IMAP folder to operate on.
+        from_address: From-header value or substring to match. The IMAP
+            server's SEARCH FROM is used, so the match is server-defined —
+            usually a substring against the address.
+        confirm_count: the exact number of messages the caller intends to
+            delete. Must match the live SEARCH count exactly.
+
+    Returns:
+        On success: {"purged_count": N, "confirmed_count": N,
+                     "from_address": ..., "folder": ...}
+        On count mismatch (no deletion happens):
+                    {"refused": true, "reason": "count_mismatch",
+                     "expected_count": N, "actual_count": K,
+                     "from_address": ..., "folder": ...,
+                     "message": "..."}
+        On zero matches even though confirm_count==0: treated as success
+        with purged_count=0 (the operation is a no-op).
+    """
+    if confirm_count < 0:
+        raise ValueError("confirm_count must be >= 0")
+
+    pool = _get_pool()
+    mb = pool.get(host)
+    mb.folder.set(folder)
+
+    matched_uids = list(mb.uids(AND(from_=from_address)))
+    actual = len(matched_uids)
+
+    if actual != confirm_count:
+        return {
+            "refused": True,
+            "reason": "count_mismatch",
+            "expected_count": confirm_count,
+            "actual_count": actual,
+            "from_address": from_address,
+            "folder": folder,
+            "message": (
+                f"refused: search returned {actual} message(s) from "
+                f"{from_address!r}, but you confirmed {confirm_count}. "
+                f"Re-run search and retry with confirm_count={actual}."
+            ),
+        }
+
+    if actual == 0:
+        # confirm_count was also 0; no work to do.
+        return {
+            "purged_count": 0,
+            "confirmed_count": 0,
+            "from_address": from_address,
+            "folder": folder,
+        }
+
+    mb.delete(matched_uids)
+    return {
+        "purged_count": actual,
+        "confirmed_count": confirm_count,
+        "from_address": from_address,
+        "folder": folder,
+    }
+
+
+@mcp.tool()
 def server_info() -> dict[str, str]:
     """Return server version and configuration locations for diagnostics."""
     cfg_path = config_path()
